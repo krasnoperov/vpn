@@ -1,0 +1,108 @@
+#cloud-config
+packages:
+ - letsencrypt
+ - strongswan
+ - libcharon-extra-plugins
+ - jq
+ - unattended-upgrades
+ - firewalld
+
+write_files:
+  - path: /etc/ipsec.conf
+    content: |
+      config setup
+        charondebug="ike 1, knl 1, cfg 0"
+        uniqueids=no
+      conn ikev2-vpn
+        auto=add
+        compress=no
+        type=tunnel
+        keyexchange=ikev2
+        fragmentation=yes
+        forceencaps=yes
+        dpdaction=clear
+        dpddelay=300s
+        rekey=no
+        left=%any
+        leftid=${DOMAIN}
+        leftcert=cert.pem
+        leftsendcert=always
+        leftsubnet=0.0.0.0/0
+        right=%any
+        rightid=%any
+        rightauth=eap-mschapv2
+        rightsourceip=10.10.10.0/24
+        rightdns=8.8.8.8,8.8.4.4
+        rightsendcert=never
+        eap_identity=%identity
+        ike=aes256-sha1-modp1024,aes256gcm16-sha256-ecp521,aes256-sha256-ecp384,aes256gcm16-prfsha384-ecp384
+        esp=aes256-sha1,aes128-sha256-modp3072,aes256gcm16-sha256,aes256gcm16-ecp384
+
+  - path: /etc/ipsec.secrets
+    content: |
+      : RSA "privkey.pem"
+      ${USER} : EAP "${PASS}"
+
+  - path: /etc/sysctl.conf
+    content: |
+      net.ipv4.ip_forward = 1
+      net.ipv4.conf.all.rp_filter = 0
+      net.ipv4.conf.default.rp_filter = 0
+      net.ipv4.conf.eth0.rp_filter = 0
+      net.ipv4.conf.all.send_redirects = 0
+      net.ipv4.conf.default.send_redirects = 0
+      net.ipv4.conf.all.accept_redirects = 0
+      net.ipv4.conf.default.accept_redirects = 0
+
+  - path: /etc/cron.d/letsencrypt_renew
+    owner: root:root
+    content: "15 3 * * * /usr/bin/certbot renew --quiet"
+
+  - path: /etc/apt/apt.conf.d/10periodic
+    content: |
+      APT::Periodic::Update-Package-Lists "1";
+      APT::Periodic::Download-Upgradeable-Packages "1";
+      APT::Periodic::AutocleanInterval "7";
+      APT::Periodic::Unattended-Upgrade "1";
+
+runcmd:
+  - sysctl -p /etc/sysctl.conf
+  - sed -r \
+    -e 's|^//Unattended-Upgrade::MinimalSteps "true";$|Unattended-Upgrade::MinimalSteps "true";|' \
+    -e 's|^//Unattended-Upgrade::Remove-Unused-Dependencies "false";|Unattended-Upgrade::Remove-Unused-Dependencies "true";|' \
+    -e 's|^//Unattended-Upgrade::Automatic-Reboot "false";$|Unattended-Upgrade::Automatic-Reboot "true";|' \
+    -e 's|^//Unattended-Upgrade::Automatic-Reboot-Time "02:00";$|Unattended-Upgrade::Automatic-Reboot-Time "03:00";|' \
+    -i /etc/apt/apt.conf.d/50unattended-upgrades
+  - systemctl restart unattended-upgrades
+
+  # setup firewall
+  - firewall-cmd --zone=public --permanent --add-rich-rule='rule protocol value="esp" accept'
+  - firewall-cmd --zone=public --permanent --add-rich-rule='rule protocol value="ah" accept'
+  - firewall-cmd --zone=public --permanent --add-port=500/udp
+  - firewall-cmd --zone=public --permanent --add-port=4500/udp
+  - firewall-cmd --zone=public --permanent --add-service="ipsec"
+  - firewall-cmd --zone=public --permanent --add-port=443/tcp
+  - firewall-cmd --zone=public --permanent --add-port=80/tcp
+  - firewall-cmd --zone=public --permanent --add-service=ssh
+  - firewall-cmd --zone=public --permanent --add-masquerade
+  - firewall-cmd --zone=public --permanent --add-interface=eth0
+  - firewall-cmd --reload
+  - systemctl restart firewalld
+  - systemctl enable firewalld
+
+  # get the email for letsencrypt from do api
+  - 'export EMAIL=$(curl -X GET -H "Content-Type: application/json" -H "Authorization: Bearer ${DO_PAT}"  https://api.digitalocean.com/v2/account  | jq -r ".account.email")'
+  - certbot certonly --standalone -n -m $${EMAIL} -d ${DOMAIN} --agree-tos
+
+  # Share certificate and private key with ipsec
+  - ln -f -s /etc/letsencrypt/live/${DOMAIN}/cert.pem    /etc/ipsec.d/certs/cert.pem
+  - ln -f -s /etc/letsencrypt/live/${DOMAIN}/privkey.pem /etc/ipsec.d/private/privkey.pem
+  - ln -f -s /etc/letsencrypt/live/${DOMAIN}/chain.pem   /etc/ipsec.d/cacerts/chain.pem
+
+  # Relax AppArmor to load custom file in StrongSwan
+  - echo "/etc/letsencrypt/archive/${DOMAIN}/* r," >> /etc/apparmor.d/local/usr.lib.ipsec.charon
+  - systemctl reload apparmor.service
+
+  # Reload StrongSwan
+  - systemctl restart strongswan-starter
+  - systemctl enable strongswan-starter
